@@ -1,0 +1,754 @@
+import customtkinter as ctk
+import mysql.connector
+from datetime import datetime, timedelta
+import threading
+import time
+from plyer import notification
+import tkinter as tk
+from tkinter import messagebox
+from tkcalendar import Calendar
+from zoneinfo import ZoneInfo
+import random
+
+# Set appearance mode
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+class ToDoApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("To-Do List Application")
+        self.root.geometry("900x600")
+
+        # Initialize MySQL connection
+        try:
+            self.db = mysql.connector.connect(
+                host="localhost",
+                user="todo_user",
+                password="secure_password",
+                database="todo_app"
+            )
+            self.cursor = self.db.cursor()
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to connect to database: {err}")
+            self.root.destroy()
+            return
+
+        # Create tables if they don't exist
+        self.create_tables()
+
+        # Appearance mode variable
+        self.is_dark_mode = True
+
+        # Prayer times for Bangladesh in 12-hour format (approximate, replace with API for accuracy)
+        self.prayer_times = {
+            "Fajr": "4:30 AM",
+            "Dhuhr": "12:00 PM",
+            "Asr": "3:30 PM",
+            "Maghrib": "6:30 PM",
+            "Isha": "8:00 PM"
+        }
+        self.bangladesh_tz = ZoneInfo("Asia/Dhaka")
+
+        # Hadith list (short Hadiths in English)
+        self.hadiths = [
+            "The best of you are those who are best to their families. (Tirmidhi)",
+            "Seek knowledge from the cradle to the grave. (Ibn Majah)",
+            "The merciful are shown mercy by the Most Merciful. (Tirmidhi)",
+            "Whoever believes in Allah and the Last Day should speak good or remain silent. (Bukhari)",
+            "The strong man is not the one who wrestles, but the one who controls himself in anger. (Bukhari)",
+            "Charity does not decrease wealth. (Muslim)",
+            "Smiling in your brother's face is an act of charity. (Tirmidhi)",
+            "The best deed is to bring happiness to a believer. (Tabarani)",
+            "He who is not grateful to people is not grateful to Allah. (Tirmidhi)",
+            "Leave what makes you doubt for what does not make you doubt. (Tirmidhi)"
+        ]
+        self.shown_hadiths = []  # Track shown Hadiths with timestamps
+        self.last_popup_time = None  # Track last popup time
+
+        # Setup GUI
+        self.setup_gui()
+
+        # Start background reminder checker
+        self.reminder_thread = threading.Thread(target=self.check_reminders, daemon=True)
+        self.reminder_thread.start()
+
+        # Start prayer times update
+        self.update_prayer_display()
+
+        # Start Hadith popup checker
+        self.hadith_thread = threading.Thread(target=self.check_hadith_popup, daemon=True)
+        self.hadith_thread.start()
+
+    def create_tables(self):
+        """Create database tables if they don't exist."""
+        try:
+            self.cursor.execute("""
+                                CREATE TABLE IF NOT EXISTS notes
+                                (
+                                    id
+                                    INT
+                                    AUTO_INCREMENT
+                                    PRIMARY
+                                    KEY,
+                                    title
+                                    VARCHAR
+                                (
+                                    255
+                                ) NOT NULL,
+                                    content TEXT NOT NULL,
+                                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                                    )
+                                """)
+            self.cursor.execute("""
+                                CREATE TABLE IF NOT EXISTS schedule
+                                (
+                                    id
+                                    INT
+                                    AUTO_INCREMENT
+                                    PRIMARY
+                                    KEY,
+                                    task
+                                    VARCHAR
+                                (
+                                    255
+                                ) NOT NULL,
+                                    time_slot TIME NOT NULL,
+                                    date DATE NOT NULL,
+                                    completed BOOLEAN DEFAULT FALSE
+                                    )
+                                """)
+            self.cursor.execute("""
+                                CREATE TABLE IF NOT EXISTS reminders
+                                (
+                                    id
+                                    INT
+                                    AUTO_INCREMENT
+                                    PRIMARY
+                                    KEY,
+                                    title
+                                    VARCHAR
+                                (
+                                    255
+                                ) NOT NULL,
+                                    reminder_time DATETIME NOT NULL,
+                                    `repeat` BOOLEAN DEFAULT FALSE
+                                    )
+                                """)
+            self.db.commit()
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to create tables: {err}")
+            self.root.destroy()
+
+    def setup_gui(self):
+        """Set up the main GUI layout with prayer times marquee."""
+        # Prayer times marquee frame
+        self.marquee_frame = ctk.CTkFrame(self.root, height=40, corner_radius=10)
+        self.marquee_frame.pack(fill="x", padx=10, pady=5)
+
+        self.marquee_canvas = tk.Canvas(
+            self.marquee_frame,
+            height=30,
+            bg="#2b2b2b" if self.is_dark_mode else "#ffffff",
+            highlightthickness=0
+        )
+        self.marquee_canvas.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.marquee_text = self.marquee_canvas.create_text(
+            0, 15, anchor="w", font=("Roboto", 14), fill="#ffffff" if self.is_dark_mode else "#000000"
+        )
+
+        # Main container
+        self.main_container = ctk.CTkFrame(self.root)
+        self.main_container.pack(fill="both", expand=True)
+
+        self.sidebar = ctk.CTkFrame(self.main_container, width=200)
+        self.sidebar.pack(side="left", fill="y", padx=5, pady=5)
+
+        self.notes_btn = ctk.CTkButton(self.sidebar, text="Notes", command=self.show_notes, corner_radius=10)
+        self.notes_btn.pack(pady=10, padx=10, fill="x")
+
+        self.schedule_btn = ctk.CTkButton(self.sidebar, text="Schedule", command=self.show_schedule, corner_radius=10)
+        self.schedule_btn.pack(pady=10, padx=10, fill="x")
+
+        self.reminders_btn = ctk.CTkButton(self.sidebar, text="Reminders", command=self.show_reminders,
+                                           corner_radius=10)
+        self.reminders_btn.pack(pady=10, padx=10, fill="x")
+
+        self.theme_btn = ctk.CTkButton(self.sidebar, text="Switch to Light Mode", command=self.toggle_theme,
+                                       corner_radius=10)
+        self.theme_btn.pack(pady=10, padx=10, fill="x", side="bottom")
+
+        self.content_frame = ctk.CTkFrame(self.main_container)
+        self.content_frame.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+        self.show_notes()
+
+    def toggle_theme(self):
+        """Toggle between dark and light theme."""
+        self.is_dark_mode = not self.is_dark_mode
+        ctk.set_appearance_mode("dark" if self.is_dark_mode else "light")
+        self.theme_btn.configure(text="Switch to Light Mode" if self.is_dark_mode else "Switch to Dark Mode")
+        # Update marquee canvas and text color
+        self.marquee_canvas.configure(bg="#2b2b2b" if self.is_dark_mode else "#ffffff")
+        self.marquee_canvas.itemconfig(
+            self.marquee_text, fill="#ffffff" if self.is_dark_mode else "#000000"
+        )
+
+    def get_upcoming_prayers(self):
+        """Get upcoming prayer times for today in Bangladesh time, displayed in 12-hour format."""
+        now = datetime.now(self.bangladesh_tz)
+        today = now.date()
+        upcoming = []
+
+        for prayer, time_str in self.prayer_times.items():
+            # Parse 12-hour format time for today
+            try:
+                prayer_time = datetime.strptime(f"{today} {time_str}", "%Y-%m-%d %I:%M %p")
+                prayer_time = prayer_time.replace(tzinfo=self.bangladesh_tz)
+                if now < prayer_time:
+                    upcoming.append(f"{prayer}: {time_str}")
+            except ValueError as e:
+                print(f"Error parsing prayer time for {prayer}: {e}")
+                continue
+
+        return "  |  ".join(upcoming) or "No upcoming prayers today"
+
+    def scroll_marquee(self, text, x_pos):
+        """Animate the marquee text scrolling from right to left."""
+        if not text:
+            return
+
+        canvas_width = self.marquee_canvas.winfo_width()
+        text_width = self.marquee_canvas.bbox(self.marquee_text)[2] - self.marquee_canvas.bbox(self.marquee_text)[0]
+
+        if x_pos < -text_width:
+            x_pos = canvas_width
+
+        self.marquee_canvas.coords(self.marquee_text, x_pos, 15)
+        x_pos -= 2
+        self.root.after(30, lambda: self.scroll_marquee(text, x_pos))
+
+    def update_prayer_display(self):
+        """Update the marquee with upcoming prayer times."""
+        prayer_text = self.get_upcoming_prayers()
+        self.marquee_canvas.itemconfig(self.marquee_text, text=prayer_text)
+        canvas_width = self.marquee_canvas.winfo_width()
+        self.scroll_marquee(prayer_text, canvas_width)
+        self.root.after(60000, self.update_prayer_display)
+
+    def show_hadith_popup(self, hadith):
+        """Display a popup with a Hadith, using fade-in animation."""
+        popup = ctk.CTkToplevel(self.root)
+        popup.title("Daily Hadith")
+        popup.geometry("300x150")
+        popup.transient(self.root)
+        popup.attributes("-alpha", 0.0)  # Start transparent for fade-in
+        popup.resizable(False, False)
+
+        # Style popup to match theme
+        popup.configure(fg_color="#2b2b2b" if self.is_dark_mode else "#ffffff")
+        frame = ctk.CTkFrame(popup, corner_radius=10)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Hadith text
+        label = ctk.CTkLabel(
+            frame,
+            text=hadith,
+            font=("Roboto", 12),
+            wraplength=260,
+            text_color="#ffffff" if self.is_dark_mode else "#000000"
+        )
+        label.pack(pady=10)
+
+        # Close button
+        close_btn = ctk.CTkButton(
+            frame,
+            text="Close",
+            command=popup.destroy,
+            corner_radius=10,
+            width=100
+        )
+        close_btn.pack(pady=5)
+
+        # Fade-in animation
+        def fade_in(alpha=0.0):
+            alpha += 0.1
+            if alpha <= 1.0:
+                popup.attributes("-alpha", alpha)
+                popup.after(50, lambda: fade_in(alpha))
+
+        fade_in()
+
+    def check_hadith_popup(self):
+        """Check if it's time to show a Hadith popup (every 6 hours)."""
+        while True:
+            now = datetime.now()
+            # Clear shown Hadiths older than 24 hours
+            self.shown_hadiths = [
+                (hadith, timestamp) for hadith, timestamp in self.shown_hadiths
+                if (now - timestamp).total_seconds() < 24 * 3600
+            ]
+
+            # Check if 6 hours have passed since last popup or if it's the first popup
+            if (self.last_popup_time is None or
+                    (now - self.last_popup_time).total_seconds() >= 6 * 3600):
+                # Select a Hadith not shown in the last 24 hours
+                available_hadiths = [
+                    h for h in self.hadiths if h not in [sh[0] for sh in self.shown_hadiths]
+                ]
+                if not available_hadiths:  # Reset if all Hadiths used
+                    self.shown_hadiths.clear()
+                    available_hadiths = self.hadiths
+
+                selected_hadith = random.choice(available_hadiths)
+                self.shown_hadiths.append((selected_hadith, now))
+                self.last_popup_time = now
+
+                # Schedule popup on main thread
+                self.root.after(0, lambda: self.show_hadith_popup(selected_hadith))
+
+            time.sleep(60)  # Check every minute
+
+    def clear_content(self):
+        """Clear the content frame."""
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+
+    def show_notes(self):
+        """Display the Notes section."""
+        self.clear_content()
+
+        ctk.CTkLabel(self.content_frame, text="Notes", font=("Roboto", 24)).pack(pady=10)
+
+        add_frame = ctk.CTkFrame(self.content_frame)
+        add_frame.pack(fill="x", padx=10, pady=5)
+
+        self.note_title = ctk.CTkEntry(add_frame, placeholder_text="Note Title")
+        self.note_title.pack(side="left", padx=5, fill="x", expand=True)
+
+        self.note_content = ctk.CTkTextbox(add_frame, height=100)
+        self.note_content.pack(side="left", padx=5, fill="x", expand=True)
+
+        ctk.CTkButton(add_frame, text="Add Note", command=self.add_note, corner_radius=10).pack(side="left", padx=5)
+
+        self.notes_listbox = tk.Listbox(self.content_frame, height=15, selectmode=tk.SINGLE)
+        self.notes_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+
+        btn_frame = ctk.CTkFrame(self.content_frame)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkButton(btn_frame, text="Edit Note", command=self.edit_note, corner_radius=10).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Delete Note", command=self.delete_note, corner_radius=10).pack(side="left",
+                                                                                                      padx=5)
+        ctk.CTkButton(btn_frame, text="Refresh", command=self.load_notes, corner_radius=10).pack(side="left", padx=5)
+
+        self.load_notes()
+
+    def add_note(self):
+        """Add a new note to the database."""
+        title = self.note_title.get().strip()
+        content = self.note_content.get("1.0", "end-1c").strip()
+        if not title or not content:
+            messagebox.showwarning("Warning", "Please enter both title and content")
+            return
+        try:
+            self.cursor.execute("INSERT INTO notes (title, content) VALUES (%s, %s)", (title, content))
+            self.db.commit()
+            self.load_notes()
+            self.note_title.delete(0, "end")
+            self.note_content.delete("1.0", "end")
+            messagebox.showinfo("Success", "Note added successfully")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to add note: {err}")
+
+    def load_notes(self):
+        """Load notes from the database into the Listbox."""
+        self.notes_listbox.delete(0, "end")
+        try:
+            self.cursor.execute("SELECT id, title, content, created_at FROM notes ORDER BY created_at DESC")
+            for note in self.cursor.fetchall():
+                content_preview = note[2][:30] + "..." if len(note[2]) > 30 else note[2]
+                self.notes_listbox.insert("end", f"{note[0]}: {note[1]} | {content_preview} | Created: {note[3]}")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to load notes: {err}")
+
+    def edit_note(self):
+        """Edit a selected note."""
+        if not self.notes_listbox.curselection():
+            messagebox.showwarning("Warning", "Please select a note to edit")
+            return
+
+        try:
+            selected_index = self.notes_listbox.curselection()[0]
+            selected = self.notes_listbox.get(selected_index)
+            note_id = selected.split(":")[0].strip()
+
+            self.cursor.execute("SELECT title, content FROM notes WHERE id = %s", (note_id,))
+            result = self.cursor.fetchone()
+            if not result:
+                messagebox.showerror("Error", "Note not found")
+                return
+            title, content = result
+
+            edit_window = ctk.CTkToplevel(self.root)
+            edit_window.title("Edit Note")
+            edit_window.geometry("400x300")
+            edit_window.transient(self.root)
+            edit_window.grab_set()
+
+            ctk.CTkLabel(edit_window, text="Title:", font=("Roboto", 14)).pack(pady=5)
+            title_entry = ctk.CTkEntry(edit_window)
+            title_entry.insert(0, title)
+            title_entry.pack(fill="x", padx=10, pady=5)
+
+            ctk.CTkLabel(edit_window, text="Content:", font=("Roboto", 14)).pack(pady=5)
+            content_text = ctk.CTkTextbox(edit_window, height=150)
+            content_text.insert("1.0", content)
+            content_text.pack(fill="both", expand=True, padx=10, pady=5)
+
+            def save_changes():
+                new_title = title_entry.get().strip()
+                new_content = content_text.get("1.0", "end-1c").strip()
+                if not new_title or not new_content:
+                    messagebox.showwarning("Warning", "Please enter both title and content")
+                    return
+                try:
+                    self.cursor.execute("UPDATE notes SET title = %s, content = %s WHERE id = %s",
+                                        (new_title, new_content, note_id))
+                    self.db.commit()
+                    self.load_notes()
+                    edit_window.destroy()
+                    messagebox.showinfo("Success", "Note updated successfully")
+                except mysql.connector.Error as err:
+                    messagebox.showerror("Database Error", f"Failed to update note: {err}")
+
+            ctk.CTkButton(edit_window, text="Save Changes", command=save_changes, corner_radius=10).pack(pady=10)
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to retrieve note: {err}")
+
+    def delete_note(self):
+        """Delete a selected note."""
+        if not self.notes_listbox.curselection():
+            messagebox.showwarning("Warning", "Please select a note to delete")
+            return
+
+        try:
+            selected_index = self.notes_listbox.curselection()[0]
+            selected = self.notes_listbox.get(selected_index)
+            note_id = selected.split(":")[0].strip()
+            if messagebox.askyesno("Confirm", "Are you sure you want to delete this note?"):
+                self.cursor.execute("DELETE FROM notes WHERE id = %s", (note_id,))
+                self.db.commit()
+                self.load_notes()
+                messagebox.showinfo("Success", "Note deleted successfully")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to delete note: {err}")
+
+    def show_schedule(self):
+        """Display the Schedule section."""
+        self.clear_content()
+
+        ctk.CTkLabel(self.content_frame, text="Daily Schedule", font=("Roboto", 24)).pack(pady=10)
+
+        add_frame = ctk.CTkFrame(self.content_frame)
+        add_frame.pack(fill="x", padx=10, pady=5)
+
+        self.task_entry = ctk.CTkEntry(add_frame, placeholder_text="Task")
+        self.task_entry.pack(side="left", padx=5, fill="x", expand=True)
+
+        self.time_entry = ctk.CTkEntry(add_frame, placeholder_text="Time (HH:MM)")
+        self.time_entry.pack(side="left", padx=5)
+
+        self.date_entry = ctk.CTkEntry(add_frame, placeholder_text="Date (YYYY-MM-DD)")
+        self.date_entry.pack(side="left", padx=5)
+
+        ctk.CTkButton(add_frame, text="Add Task", command=self.add_schedule, corner_radius=10).pack(side="left", padx=5)
+
+        self.schedule_listbox = tk.Listbox(self.content_frame, height=15, selectmode=tk.SINGLE)
+        self.schedule_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+
+        btn_frame = ctk.CTkFrame(self.content_frame)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkButton(btn_frame, text="Mark Completed", command=self.mark_completed, corner_radius=10).pack(side="left",
+                                                                                                            padx=5)
+        ctk.CTkButton(btn_frame, text="Delete Task", command=self.delete_schedule, corner_radius=10).pack(side="left",
+                                                                                                          padx=5)
+        ctk.CTkButton(btn_frame, text="Refresh", command=self.load_schedule, corner_radius=10).pack(side="left", padx=5)
+
+        self.load_schedule()
+
+    def add_schedule(self):
+        """Add a new schedule task."""
+        task = self.task_entry.get().strip()
+        time_str = self.time_entry.get().strip()
+        date_str = self.date_entry.get().strip()
+
+        if not task or not time_str or not date_str:
+            messagebox.showwarning("Warning", "Please fill in all fields")
+            return
+
+        try:
+            datetime.strptime(time_str, "%H:%M")
+            datetime.strptime(date_str, "%Y-%m-%d")
+            self.cursor.execute("INSERT INTO schedule (task, time_slot, date) VALUES (%s, %s, %s)",
+                                (task, time_str, date_str))
+            self.db.commit()
+            self.load_schedule()
+            self.task_entry.delete(0, "end")
+            self.time_entry.delete(0, "end")
+            self.date_entry.delete(0, "end")
+            messagebox.showinfo("Success", "Task added successfully")
+        except ValueError:
+            messagebox.showwarning("Warning", "Invalid format. Use HH:MM for time and YYYY-MM-DD for date")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to add task: {err}")
+
+    def load_schedule(self):
+        """Load schedule tasks into the Listbox."""
+        self.schedule_listbox.delete(0, "end")
+        try:
+            self.cursor.execute("SELECT id, task, time_slot, date, completed FROM schedule ORDER BY date, time_slot")
+            for task in self.cursor.fetchall():
+                status = "✓" if task[4] else ""
+                self.schedule_listbox.insert("end", f"{task[0]}: {task[1]} at {task[2]} on {task[3]} {status}")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to load schedule: {err}")
+
+    def mark_completed(self):
+        """Mark a selected task as completed."""
+        if not self.schedule_listbox.curselection():
+            messagebox.showwarning("Warning", "Please select a task")
+            return
+
+        try:
+            selected_index = self.schedule_listbox.curselection()[0]
+            selected = self.schedule_listbox.get(selected_index)
+            task_id = selected.split(":")[0].strip()
+            self.cursor.execute("UPDATE schedule SET completed = TRUE WHERE id = %s", (task_id,))
+            self.db.commit()
+            self.load_schedule()
+            messagebox.showinfo("Success", "Task marked as completed")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to mark task as completed: {err}")
+
+    def delete_schedule(self):
+        """Delete a selected schedule task."""
+        if not self.schedule_listbox.curselection():
+            messagebox.showwarning("Warning", "Please select a task")
+            return
+
+        try:
+            selected_index = self.schedule_listbox.curselection()[0]
+            selected = self.schedule_listbox.get(selected_index)
+            task_id = selected.split(":")[0].strip()
+            if messagebox.askyesno("Confirm", "Are you sure you want to delete this task?"):
+                self.cursor.execute("DELETE FROM schedule WHERE id = %s", (task_id,))
+                self.db.commit()
+                self.load_schedule()
+                messagebox.showinfo("Success", "Task deleted successfully")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to delete task: {err}")
+
+    def show_reminders(self):
+        """Display the Reminders section."""
+        self.clear_content()
+
+        ctk.CTkLabel(self.content_frame, text="Reminders", font=("Roboto", 24)).pack(pady=10)
+
+        add_frame = ctk.CTkFrame(self.content_frame)
+        add_frame.pack(fill="x", padx=10, pady=5)
+
+        self.reminder_title = ctk.CTkEntry(add_frame, placeholder_text="Reminder Title")
+        self.reminder_title.pack(side="left", padx=5, fill="x", expand=True)
+
+        self.reminder_time_label = ctk.CTkLabel(add_frame, text="No date/time selected")
+        self.reminder_time_label.pack(side="left", padx=5)
+
+        ctk.CTkButton(add_frame, text="Select Date & Time", command=self.open_datetime_picker, corner_radius=10).pack(
+            side="left", padx=5)
+
+        self.repeat_var = ctk.BooleanVar()
+        ctk.CTkCheckBox(add_frame, text="Repeat Daily", variable=self.repeat_var).pack(side="left", padx=5)
+
+        ctk.CTkButton(add_frame, text="Add Reminder", command=self.add_reminder, corner_radius=10).pack(side="left",
+                                                                                                        padx=5)
+
+        self.reminders_listbox = tk.Listbox(self.content_frame, height=15, selectmode=tk.SINGLE)
+        self.reminders_listbox.pack(fill="both", expand=True, padx=10, pady=5)
+
+        btn_frame = ctk.CTkFrame(self.content_frame)
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        ctk.CTkButton(btn_frame, text="Delete Reminder", command=self.delete_reminder, corner_radius=10).pack(
+            side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Refresh", command=self.load_reminders, corner_radius=10).pack(side="left",
+                                                                                                     padx=5)
+
+        self.selected_datetime = None
+        self.load_reminders()
+
+    def open_datetime_picker(self):
+        """Open a dialog for selecting date and time with AM/PM."""
+        picker_window = ctk.CTkToplevel(self.root)
+        picker_window.title("Select Date and Time")
+        picker_window.geometry("400x450")
+        picker_window.transient(self.root)
+        picker_window.grab_set()
+
+        ctk.CTkLabel(picker_window, text="Select Date:", font=("Roboto", 14)).pack(pady=5)
+        calendar = Calendar(picker_window, selectmode="day", date_pattern="yyyy-mm-dd")
+        calendar.pack(padx=10, pady=5)
+
+        ctk.CTkLabel(picker_window, text="Select Time:", font=("Roboto", 14)).pack(pady=5)
+        time_frame = ctk.CTkFrame(picker_window)
+        time_frame.pack(padx=10, pady=5)
+
+        hour_entry = ctk.CTkEntry(time_frame, placeholder_text="HH (1-12)", width=60)
+        hour_entry.pack(side="left", padx=5)
+        ctk.CTkLabel(time_frame, text=":").pack(side="left")
+        minute_entry = ctk.CTkEntry(time_frame, placeholder_text="MM (00-59)", width=60)
+        minute_entry.pack(side="left", padx=5)
+
+        am_pm_var = tk.StringVar(value="AM")
+        am_pm_dropdown = ctk.CTkOptionMenu(time_frame, values=["AM", "PM"], variable=am_pm_var, width=80)
+        am_pm_dropdown.pack(side="left", padx=5)
+
+        def save_datetime():
+            try:
+                date_str = calendar.get_date()
+                hour = hour_entry.get().strip()
+                minute = minute_entry.get().strip()
+                am_pm = am_pm_var.get()
+
+                hour_int = int(hour)
+                minute_int = int(minute)
+                if not (1 <= hour_int <= 12):
+                    raise ValueError("Hour must be between 1 and 12")
+                if not (0 <= minute_int <= 59):
+                    raise ValueError("Minute must be between 00 and 59")
+
+                if am_pm == "AM":
+                    if hour_int == 12:
+                        hour_24 = 0
+                    else:
+                        hour_24 = hour_int
+                else:
+                    if hour_int == 12:
+                        hour_24 = 12
+                    else:
+                        hour_24 = hour_int + 12
+
+                time_str = f"{hour_24:02d}:{minute_int:02d}"
+                combined_datetime = f"{date_str} {time_str}"
+
+                datetime.strptime(combined_datetime, "%Y-%m-%d %H:%M")
+                self.selected_datetime = combined_datetime
+                display_time = f"{hour_int}:{minute_int:02d} {am_pm}"
+                self.reminder_time_label.configure(text=f"Selected: {date_str} {display_time}")
+                picker_window.destroy()
+            except ValueError as ve:
+                messagebox.showwarning("Warning", f"Invalid time format: {str(ve)}. Use HH (1-12) and MM (00-59).")
+                return
+
+        ctk.CTkButton(picker_window, text="Confirm", command=save_datetime, corner_radius=10).pack(pady=10)
+
+    def add_reminder(self):
+        """Add a new reminder with selected datetime."""
+        title = self.reminder_title.get().strip()
+        time_str = self.selected_datetime
+        repeat = self.repeat_var.get()
+
+        if not title:
+            messagebox.showwarning("Warning", "Please enter a reminder title")
+            return
+        if not time_str:
+            messagebox.showwarning("Warning", "Please select a date and time")
+            return
+
+        try:
+            datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+            self.cursor.execute("INSERT INTO reminders (title, reminder_time, `repeat`) VALUES (%s, %s, %s)",
+                                (title, time_str, repeat))
+            self.db.commit()
+            self.load_reminders()
+            self.reminder_title.delete(0, "end")
+            self.reminder_time_label.configure(text="No date/time selected")
+            self.selected_datetime = None
+            self.repeat_var.set(False)
+            messagebox.showinfo("Success", "Reminder added successfully")
+        except ValueError:
+            messagebox.showwarning("Warning", "Invalid datetime format")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to add reminder: {err}")
+
+    def load_reminders(self):
+        """Load reminders into the Listbox."""
+        self.reminders_listbox.delete(0, "end")
+        try:
+            self.cursor.execute("SELECT id, title, reminder_time, `repeat` FROM reminders ORDER BY reminder_time")
+            for reminder in self.cursor.fetchall():
+                repeat_status = " (Repeats)" if reminder[3] else ""
+                self.reminders_listbox.insert("end", f"{reminder[0]}: {reminder[1]} at {reminder[2]}{repeat_status}")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to load reminders: {err}")
+
+    def delete_reminder(self):
+        """Delete a selected reminder."""
+        if not self.reminders_listbox.curselection():
+            messagebox.showwarning("Warning", "Please select a reminder")
+            return
+
+        try:
+            selected_index = self.reminders_listbox.curselection()[0]
+            selected = self.reminders_listbox.get(selected_index)
+            reminder_id = selected.split(":")[0].strip()
+            if messagebox.askyesno("Confirm", "Are you sure you want to delete this reminder?"):
+                self.cursor.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+                self.db.commit()
+                self.load_reminders()
+                messagebox.showinfo("Success", "Reminder deleted successfully")
+        except mysql.connector.Error as err:
+            messagebox.showerror("Database Error", f"Failed to delete reminder: {err}")
+
+    def check_reminders(self):
+        """Check for due reminders and send notifications."""
+        while True:
+            try:
+                self.cursor.execute("SELECT id, title, reminder_time, `repeat` FROM reminders")
+                current_time = datetime.now()
+
+                for reminder in self.cursor.fetchall():
+                    reminder_id, title, reminder_time, repeat = reminder
+                    reminder_time = datetime.strptime(str(reminder_time), "%Y-%m-%d %H:%M:%S")
+
+                    if current_time >= reminder_time and (current_time - reminder_time).total_seconds() < 60:
+                        notification.notify(
+                            title="Reminder",
+                            message=title,
+                            timeout=10
+                        )
+
+                        if repeat:
+                            new_time = reminder_time + timedelta(days=1)
+                            self.cursor.execute("UPDATE reminders SET reminder_time = %s WHERE id = %s",
+                                                (new_time, reminder_id))
+                        else:
+                            self.cursor.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
+                        self.db.commit()
+
+                time.sleep(30)
+            except mysql.connector.Error as err:
+                print(f"Reminder check error: {err}")
+                time.sleep(30)
+            except ValueError as ve:
+                print(f"Reminder time parsing error: {ve}")
+                time.sleep(30)
+
+
+if __name__ == "__main__":
+    root = ctk.CTk()
+    app = ToDoApp(root)
+    root.mainloop()
