@@ -1,14 +1,4 @@
-import customtkinter as ctk
-import mysql.connector
-from datetime import datetime, timedelta
-import threading
-import time
-from plyer import notification
-import tkinter as tk
-from tkinter import messagebox
-from tkcalendar import Calendar
-from zoneinfo import ZoneInfo
-import random
+
 
 # Set appearance mode
 ctk.set_appearance_mode("dark")
